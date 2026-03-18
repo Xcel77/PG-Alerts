@@ -1,4 +1,5 @@
 This is a sidekick-type app for Project: Gorgon, that you would run along with the game that will give a few added QoL features to chat, combat xp logging, and loot visibility. The tool contains many options to choose sounds to play when certain alerts occur, volume control, and many other customizable options.
+
 **This requires chat logs to be enabled, which requires VIP, to my knowledge.**
 
 <img width="504" height="653" alt="image" src="https://github.com/user-attachments/assets/7bca3f92-5f13-434a-810d-90bd0963a65c" />
