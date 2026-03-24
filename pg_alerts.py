@@ -120,6 +120,12 @@ XP_PATTERN = re.compile(r"\[Status\]\s+You earned (\d+) XP in (.+?)\.")
 # Group 1 = item name (including quantity like "x2" if present).
 LOOT_PATTERN = re.compile(r"\[Status\]\s+(.+?)\s+added to inventory\.")
 
+# Matches an in-game item link on its own line (no [Trade] prefix, no timestamp).
+# PG writes these as standalone lines when a player links an item in chat.
+# Example: "[Item: Priest: Flamestrike 2]" or "[Item: Explosive Runestone]"
+# Group 1 = the full item name.
+ITEM_LINK_PATTERN = re.compile(r"^\[Item:\s*(.+?)\]\s*$")
+
 # ---------------------------------------------------------------------------
 # Event Keys & Display Labels
 #
@@ -357,6 +363,9 @@ class PGAlertApp:
         # Comma-separated list of keywords to watch for in [Trade] chat.
         self.trade_keywords_var = tk.StringVar(
             value=self.settings.get("trade_keywords", ""))
+        # Tracks the most recently seen trade seller so that standalone
+        # item link lines ([Item: ...]) can be attributed to them.
+        self._last_trade_seller: str = ""
 
         # -- Volume mode --
         # "master" = single slider controls all events.
@@ -742,7 +751,8 @@ class PGAlertApp:
             side="left", padx=(16, 4))
         xp_dur = ttk.Combobox(
             xp_row1, textvariable=self.xp_overlay_duration_var,
-            values=["1s", "2s", "3s", "4s", "5s"],
+            values=["1s", "2s", "3s", "4s", "5s",
+                    "6s", "7s", "8s", "9s", "10s"],
             state="readonly", width=4)
         xp_dur.pack(side="left")
         xp_dur.bind("<<ComboboxSelected>>", self._persist)
@@ -798,7 +808,8 @@ class PGAlertApp:
             side="left", padx=(16, 4))
         loot_dur = ttk.Combobox(
             loot_row1, textvariable=self.loot_overlay_duration_var,
-            values=["1s", "2s", "3s", "4s", "5s"],
+            values=["1s", "2s", "3s", "4s", "5s",
+                    "6s", "7s", "8s", "9s", "10s"],
             state="readonly", width=4)
         loot_dur.pack(side="left")
         loot_dur.bind("<<ComboboxSelected>>", self._persist)
@@ -1440,6 +1451,7 @@ class PGAlertApp:
             # Seek to the end so we only process NEW lines going forward
             self.file_handle.seek(0, os.SEEK_END)
             self.file_pos = self.file_handle.tell()
+            self._last_trade_seller = ""  # Reset on new session log
             self._log(
                 f"Now watching: {os.path.basename(self.current_file)}",
                 "info")
@@ -1489,15 +1501,39 @@ class PGAlertApp:
                 # --- Trade Keyword Search ---
                 # Matches: [Trade] SellerName: message text
                 # Only triggers if the message contains a configured keyword.
+                # Also records the seller name so that any following item
+                # link lines ([Item: ...]) can be attributed to them.
                 m = TRADE_PATTERN.search(line)
                 if m and self.events[EVENT_TRADE]["enabled_var"].get():
                     seller, msg = m.group(1), m.group(2)
+                    self._last_trade_seller = seller
                     keyword = self._matches_trade(msg)
                     if keyword:
                         self._log_rich(
                             timestamp, f"[Trade] {seller}: ", "trade",
                             f"{msg}  (matched: {keyword})")
                         self._alert(EVENT_TRADE, f"{seller}: {msg}")
+                    continue
+
+                # --- Item Link (standalone, no [Trade] prefix) ---
+                # When a seller links an item in-game, PG writes the item
+                # reference as a separate line with no timestamp or channel
+                # prefix. We attribute it to the last seen trade seller and
+                # match keywords against the item name.
+                m = ITEM_LINK_PATTERN.search(line)
+                if m and self.events[EVENT_TRADE]["enabled_var"].get() \
+                        and self._last_trade_seller:
+                    item_name = m.group(1)
+                    keyword = self._matches_trade(item_name)
+                    if keyword:
+                        self._log_rich(
+                            timestamp,
+                            f"[Trade] {self._last_trade_seller}: ",
+                            "trade",
+                            f"[Item: {item_name}]  (matched: {keyword})")
+                        self._alert(
+                            EVENT_TRADE,
+                            f"{self._last_trade_seller}: [Item: {item_name}]")
                     continue
 
                 # --- Combat XP Gain ---
