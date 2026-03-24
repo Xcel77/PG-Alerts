@@ -13,3 +13,4 @@ This is a sidekick-type app for Project: Gorgon, that you would run along with t
 
 
 
+Xcel - Strekios
