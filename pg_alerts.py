@@ -77,11 +77,20 @@ CHAT_LOG_DIR = os.path.normpath(os.path.join(
 # otherwise the script's own directory. Used to locate bundled sounds.
 if getattr(sys, "frozen", False):
     _BASE_DIR = sys._MEIPASS
+    _RUNTIME_DIR = os.path.dirname(sys.executable)
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    _RUNTIME_DIR = _BASE_DIR
 
 # Path to the bundled sound files directory.
 SOUNDS_DIR = os.path.join(_BASE_DIR, "sounds")
+
+# Path to optional user-provided sounds beside the script/EXE.
+CUSTOM_SOUNDS_DIR = os.path.join(_RUNTIME_DIR, "custom_sounds")
+
+# Ordered sound sources. Earlier directories have higher precedence when
+# duplicate filenames exist.
+SOUND_SOURCE_DIRS = (SOUNDS_DIR, CUSTOM_SOUNDS_DIR)
 
 # Persistent settings file stored in the user's AppData.
 SETTINGS_FILE = os.path.join(
@@ -89,6 +98,9 @@ SETTINGS_FILE = os.path.join(
 
 # How often (in milliseconds) the app polls the chat log for new lines.
 POLL_INTERVAL_MS = 1000
+
+# Supported sound file extensions for alert audio.
+SOUND_EXTENSIONS = (".wav", ".mp3", ".ogg")
 
 # ---------------------------------------------------------------------------
 # Chat Log Regex Patterns
@@ -111,6 +123,11 @@ FRIEND_OFFLINE_PATTERN = re.compile(
 
 # Matches trade chat messages: "[Trade] SellerName: message text"
 TRADE_PATTERN = re.compile(r"\[Trade\]\s+(\S+):\s+(.*)")
+
+# Matches any chat channel message: "[ChannelName] PlayerName: message text"
+# Group 1 = channel name, Group 2 = player name, Group 3 = message text.
+# Excludes [Status], [NPC Chatter], and system lines.
+ANY_CHAT_PATTERN = re.compile(r"\[(\w[\w ]*?)\]\s+(\S+):\s+(.*)")
 
 # Matches combat XP gain: "[Status] You earned 81 XP in Staff."
 # Group 1 = XP amount, Group 2 = skill name.
@@ -136,15 +153,22 @@ EVENT_TELL = "tell"
 EVENT_FRIEND_ON = "friend_online"
 EVENT_FRIEND_OFF = "friend_offline"
 EVENT_TRADE = "trade"
+EVENT_GLOBAL_SEARCH = "global_search"
 
-ALL_EVENTS = (EVENT_TELL, EVENT_FRIEND_ON, EVENT_FRIEND_OFF, EVENT_TRADE)
+ALL_EVENTS = (EVENT_TELL, EVENT_FRIEND_ON, EVENT_FRIEND_OFF, EVENT_TRADE,
+              EVENT_GLOBAL_SEARCH)
 
 EVENT_LABELS = {
     EVENT_TELL: "Incoming Tell",
     EVENT_FRIEND_ON: "Friend Online",
     EVENT_FRIEND_OFF: "Friend Offline",
     EVENT_TRADE: "Trade Search",
+    EVENT_GLOBAL_SEARCH: "Global Search",
 }
+
+# Chat channels that are excluded from the Global Search.
+# These are system/NPC channels that aren't player chat.
+GLOBAL_SEARCH_EXCLUDED_CHANNELS = {"Status", "NPC Chatter"}
 
 # ---------------------------------------------------------------------------
 # Toast Notification Colors
@@ -153,10 +177,11 @@ EVENT_LABELS = {
 # text so the user can quickly identify the alert type at a glance.
 # ---------------------------------------------------------------------------
 TOAST_COLORS = {
-    EVENT_TELL: "#e6a800",      # Gold — tells
-    EVENT_FRIEND_ON: "#44cc44",  # Green — friend came online
-    EVENT_FRIEND_OFF: "#cc4444",  # Red — friend went offline
-    EVENT_TRADE: "#55aaff",     # Blue — trade keyword match
+    EVENT_TELL: "#e6a800",           # Gold — tells
+    EVENT_FRIEND_ON: "#44cc44",      # Green — friend came online
+    EVENT_FRIEND_OFF: "#cc4444",     # Red — friend went offline
+    EVENT_TRADE: "#55aaff",          # Blue — trade keyword match
+    EVENT_GLOBAL_SEARCH: "#cc88ff",  # Purple — global keyword match
 }
 
 # ---------------------------------------------------------------------------
@@ -211,20 +236,30 @@ def get_latest_chat_log(log_dir: str) -> str | None:
     return max(files, key=os.path.getmtime) if files else None
 
 
-def discover_sounds(sounds_dir: str) -> list[str]:
-    """Scan the sounds directory for playable audio files.
+def discover_sounds(sound_dirs: tuple[str, ...]) -> list[str]:
+    """Scan sound source directories for playable audio files.
 
     Returns a sorted list of filenames (not full paths) with supported
-    extensions: .wav, .mp3, .ogg. These are presented in the UI dropdowns
-    for the user to assign to each event type.
+    extensions: .wav, .mp3, .ogg. Earlier directories in sound_dirs have
+    higher precedence when duplicate filenames exist.
     """
-    exts = (".wav", ".mp3", ".ogg")
-    if not os.path.isdir(sounds_dir):
-        return []
-    return sorted(
-        f for f in os.listdir(sounds_dir)
-        if os.path.splitext(f)[1].lower() in exts
-    )
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    for sound_dir in sound_dirs:
+        if not os.path.isdir(sound_dir):
+            continue
+        for filename in sorted(os.listdir(sound_dir)):
+            if os.path.splitext(filename)[1].lower() not in SOUND_EXTENSIONS:
+                continue
+            if not os.path.isfile(os.path.join(sound_dir, filename)):
+                continue
+            if filename in seen:
+                continue
+            seen.add(filename)
+            discovered.append(filename)
+
+    return discovered
 
 
 def get_pg_monitor_work_area() -> tuple[int, int, int, int]:
@@ -343,7 +378,7 @@ class PGAlertApp:
         pygame.mixer.init()
 
         # -- Discover available sound files and load saved settings --
-        self.sound_files = discover_sounds(SOUNDS_DIR)
+        self.sound_files = discover_sounds(SOUND_SOURCE_DIRS)
         self.settings = load_settings()
 
         # -- Per-event configuration --
@@ -366,6 +401,11 @@ class PGAlertApp:
         # Tracks the most recently seen trade seller so that standalone
         # item link lines ([Item: ...]) can be attributed to them.
         self._last_trade_seller: str = ""
+
+        # -- Global search keyword filter --
+        # Comma-separated list of keywords to watch for across ALL chat channels.
+        self.global_search_keywords_var = tk.StringVar(
+            value=self.settings.get("global_search_keywords", ""))
 
         # -- Volume mode --
         # "master" = single slider controls all events.
@@ -433,6 +473,7 @@ class PGAlertApp:
         self._build_ui()
         self._update_volume_visibility()
         self._check_chat_dir()
+        self._log_custom_sound_startup_info()
 
     # =======================================================================
     # Settings Helpers
@@ -471,6 +512,9 @@ class PGAlertApp:
 
             # Trade keyword filter
             "trade_keywords": self.trade_keywords_var.get(),
+
+            # Global search keyword filter
+            "global_search_keywords": self.global_search_keywords_var.get(),
 
             # Toast notification settings
             "toast_enabled": self.toast_enabled_var.get(),
@@ -585,6 +629,20 @@ class PGAlertApp:
         self.trade_entry.bind("<FocusOut>", self._persist)
         self.trade_entry.bind("<Return>", self._persist)
 
+        # --- Global Search Keywords Section ---
+        # Text entry for comma-separated keywords to match across ALL chat channels.
+        frame_global = ttk.LabelFrame(
+            tab_alerts,
+            text="Global Search Keywords (comma-separated, all channels)")
+        frame_global.pack(fill="x", **pad)
+
+        self.global_search_entry = ttk.Entry(
+            frame_global, textvariable=self.global_search_keywords_var,
+            width=58)
+        self.global_search_entry.pack(fill="x", padx=8, pady=6)
+        self.global_search_entry.bind("<FocusOut>", self._persist)
+        self.global_search_entry.bind("<Return>", self._persist)
+
         # --- Volume Section ---
         # Provides two modes: a single master volume slider, or individual
         # per-event volume sliders. A radio button toggles between them.
@@ -677,6 +735,8 @@ class PGAlertApp:
             "offline", foreground="#cc4444")  # Friend offline
         self.log_text.tag_configure(
             "trade", foreground="#55aaff")    # Trade match
+        self.log_text.tag_configure(
+            "global_search", foreground="#cc88ff")  # Global search match
         self.log_text.tag_configure(
             "info", foreground="#888888")     # System messages
 
@@ -1315,6 +1375,57 @@ class PGAlertApp:
                 "ensure logging is enabled in the game settings.",
                 "info")
 
+    def _log_custom_sound_startup_info(self):
+        """Log startup info when custom_sounds contributes playable files.
+
+        Reports how many custom files are active in the picker and how many
+        duplicate filenames are shadowed by bundled sounds.
+        """
+        if not os.path.isdir(CUSTOM_SOUNDS_DIR):
+            return
+
+        custom_names = sorted(
+            f for f in os.listdir(CUSTOM_SOUNDS_DIR)
+            if os.path.splitext(f)[1].lower() in SOUND_EXTENSIONS
+            and os.path.isfile(os.path.join(CUSTOM_SOUNDS_DIR, f))
+        )
+        if not custom_names:
+            self._log(
+                "custom_sounds folder found, but no playable sound files "
+                "were detected (.wav, .mp3, .ogg).",
+                "info",
+            )
+            return
+
+        bundled_names = set(
+            f for f in os.listdir(SOUNDS_DIR)
+            if os.path.splitext(f)[1].lower() in SOUND_EXTENSIONS
+            and os.path.isfile(os.path.join(SOUNDS_DIR, f))
+        ) if os.path.isdir(SOUNDS_DIR) else set()
+
+        loaded_custom_count = sum(
+            1 for name in custom_names if name not in bundled_names
+        )
+        if loaded_custom_count <= 0:
+            self._log(
+                "Found custom_sounds files, but all names duplicate bundled "
+                "sounds, so custom files were not added.",
+                "info",
+            )
+            return
+
+        duplicate_count = len(custom_names) - loaded_custom_count
+        msg = (
+            f"Loaded {loaded_custom_count} custom sound file(s) "
+            "from custom_sounds."
+        )
+        if duplicate_count > 0:
+            msg += (
+                f" {duplicate_count} duplicate name(s) are using "
+                "bundled sounds."
+            )
+        self._log(msg, "info")
+
     def _sound_path_for(self, event_key: str) -> str | None:
         """Return the full filesystem path to the selected sound file
         for an event, or None if no valid sound is configured.
@@ -1322,8 +1433,11 @@ class PGAlertApp:
         name = self.events[event_key]["sound_var"].get()
         if not name:
             return None
-        path = os.path.join(SOUNDS_DIR, name)
-        return path if os.path.isfile(path) else None
+        for sound_dir in SOUND_SOURCE_DIRS:
+            path = os.path.join(sound_dir, name)
+            if os.path.isfile(path):
+                return path
+        return None
 
     def _preview_event(self, event_key: str):
         """Play the sound assigned to an event (triggered by the ▶ button)."""
@@ -1377,6 +1491,21 @@ class PGAlertApp:
         """
         msg_lower = message.lower()
         for kw in self._get_trade_keywords():
+            if kw in msg_lower:
+                return kw
+        return None
+
+    def _get_global_search_keywords(self) -> list[str]:
+        """Parse the global search keywords entry into a list of lowercase keywords."""
+        raw = self.global_search_keywords_var.get()
+        return [kw.strip().lower() for kw in raw.split(",") if kw.strip()]
+
+    def _matches_global_search(self, message: str) -> str | None:
+        """Check if a message contains any global search keyword.
+        Returns the first matching keyword, or None if no match.
+        """
+        msg_lower = message.lower()
+        for kw in self._get_global_search_keywords():
             if kw in msg_lower:
                 return kw
         return None
@@ -1535,6 +1664,25 @@ class PGAlertApp:
                             EVENT_TRADE,
                             f"{self._last_trade_seller}: [Item: {item_name}]")
                     continue
+
+                # --- Global Search ---
+                # Matches any chat channel message and checks against
+                # global search keywords. Excludes Status and NPC Chatter.
+                m = ANY_CHAT_PATTERN.search(line)
+                if m and self.events[EVENT_GLOBAL_SEARCH]["enabled_var"].get():
+                    channel, speaker, msg = m.group(1), m.group(2), m.group(3)
+                    if channel not in GLOBAL_SEARCH_EXCLUDED_CHANNELS:
+                        keyword = self._matches_global_search(msg)
+                        if keyword:
+                            self._log_rich(
+                                timestamp,
+                                f"[{channel}] {speaker}: ",
+                                "global_search",
+                                f"{msg}  (matched: {keyword})")
+                            self._alert(
+                                EVENT_GLOBAL_SEARCH,
+                                f"[{channel}] {speaker}: {msg}")
+                            continue
 
                 # --- Combat XP Gain ---
                 # Matches: [Status] You earned 81 XP in Staff.
