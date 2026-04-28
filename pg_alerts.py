@@ -374,9 +374,6 @@ class PGAlertApp:
         self.file_pos = 0                      # Read position in the log file
         self.poll_id: str | None = None        # Tkinter after() callback ID
 
-        # -- Initialize sound engine --
-        pygame.mixer.init()
-
         # -- Discover available sound files and load saved settings --
         self.sound_files = discover_sounds(SOUND_SOURCE_DIRS)
         self.settings = load_settings()
@@ -1441,9 +1438,40 @@ class PGAlertApp:
 
     def _preview_event(self, event_key: str):
         """Play the sound assigned to an event (triggered by the ▶ button)."""
+        if not self.monitoring:
+            self._log(
+                "Sound preview is only available while monitoring is running.",
+                "info",
+            )
+            return
         path = self._sound_path_for(event_key)
         if path:
             self._play_sound(path, self._get_volume(event_key))
+
+    def _init_sound_engine(self) -> bool:
+        """Initialize pygame's mixer when monitoring starts.
+
+        Returns True when audio playback is available. On failure, alerts
+        continue without sound.
+        """
+        if pygame.mixer.get_init() is not None:
+            return True
+        try:
+            pygame.mixer.init()
+            return True
+        except Exception as e:
+            self._log(f"[!] Sound init error: {e}", "info")
+            return False
+
+    def _shutdown_sound_engine(self) -> None:
+        """Release pygame's mixer so the audio device is no longer held."""
+        if pygame.mixer.get_init() is None:
+            return
+        try:
+            pygame.mixer.stop()
+        except Exception:
+            pass
+        pygame.mixer.quit()
 
     def _play_sound(self, path: str, volume: float):
         """Play a sound file at the specified volume in a background thread.
@@ -1453,6 +1481,8 @@ class PGAlertApp:
         """
         def _do():
             try:
+                if pygame.mixer.get_init() is None:
+                    return
                 sound = pygame.mixer.Sound(path)
                 sound.set_volume(volume)
                 sound.play()
@@ -1537,6 +1567,7 @@ class PGAlertApp:
         if not os.path.isdir(CHAT_LOG_DIR):
             self._log("Cannot start — chat log directory not found.", "info")
             return
+        self._init_sound_engine()
         self.monitoring = True
         self.current_file = None
         self.file_handle = None
@@ -1555,6 +1586,7 @@ class PGAlertApp:
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None
+        self._shutdown_sound_engine()
         self.btn_toggle.configure(text="Start Monitoring")
         self.status_var.set("Stopped")
         self._log("--- Stopped monitoring ---", "info")
@@ -1772,7 +1804,6 @@ class PGAlertApp:
 
         # Stop monitoring and shut down pygame
         self._stop_monitoring()
-        pygame.mixer.quit()
 
 
 # ===========================================================================
